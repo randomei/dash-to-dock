@@ -234,6 +234,11 @@ const DockAbstractAppIcon = GObject.registerClass({
 
         this._previewMenuManager = null;
         this._previewMenu = null;
+        
+        this._hoverTimeoutId = 0;
+        this._previewIsSticky = false;
+        this._hideLoopId = 0;
+        this.connect('notify::hover', this._onHoverChanged.bind(this));
     }
 
     _onDestroy() {
@@ -719,17 +724,17 @@ const DockAbstractAppIcon = GObject.registerClass({
             !Docking.DockManager.settings.hideTooltip;
     }
 
-    _windowPreviews() {
+    _ensurePreviewMenu() {
         if (!this._previewMenu) {
             this._previewMenuManager = new PopupMenu.PopupMenuManager(this);
-
             this._previewMenu = new WindowPreview.WindowPreviewMenu(this);
-
             this._previewMenuManager.addMenu(this._previewMenu);
 
             this._previewMenu.connect('open-state-changed', (menu, isPoppedUp) => {
-                if (!isPoppedUp)
+                if (!isPoppedUp) {
+                    this._previewIsSticky = false;
                     this._onMenuPoppedDown();
+                }
             });
             const id = Main.overview.connect('hiding', () => {
                 this._previewMenu.close();
@@ -738,15 +743,107 @@ const DockAbstractAppIcon = GObject.registerClass({
                 Main.overview.disconnect(id);
             });
         }
+    }
+
+    _windowPreviews() {
+        this._ensurePreviewMenu();
 
         this.emit('menu-state-changed', !this._previewMenu.isOpen);
 
-        if (this._previewMenu.isOpen)
+        if (this._previewMenu.isOpen) {
             this._previewMenu.close();
-        else
+        } else {
+            this._previewIsSticky = true;
             this._previewMenu.popup();
+        }
 
         return false;
+    }
+    
+    _isPointerOverActor(actor) {
+        if (!actor || !actor.visible) return false;
+        
+        // Получаем глобальные координаты курсора
+        const [x, y] = global.get_pointer();
+        
+        // Трансформируем глобальные координаты в локальные координаты актора
+        const [success, relX, relY] = actor.transform_stage_point(x, y);
+        
+        if (success) {
+            // Проверяем, находится ли курсор внутри границ актора
+            return relX >= 0 && relX <= actor.width && relY >= 0 && relY <= actor.height;
+        }
+        return false;
+    }
+    
+    _onHoverChanged() {
+        if (this.hover) {
+            // Курсор зашел на иконку
+            if (this._hoverTimeoutId === 0) {
+                this._hoverTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
+                    this._showHoverPreview();
+                    this._hoverTimeoutId = 0;
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+            
+            // Если курсор вернулся, пока работал цикл закрытия, останавливаем его
+            if (this._hideLoopId > 0) {
+                GLib.source_remove(this._hideLoopId);
+                this._hideLoopId = 0;
+            }
+        } else {
+            // Состояние hover потеряно (курсор ушел ИЛИ открылось меню)
+            if (this._hoverTimeoutId > 0) {
+                GLib.source_remove(this._hoverTimeoutId);
+                this._hoverTimeoutId = 0;
+            }
+
+            // Запускаем цикл проверки физического положения курсора
+            if (this._hideLoopId > 0) return; // Цикл уже работает
+
+            this._hideLoopId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+                if (this._previewIsSticky) {
+                    this._hideLoopId = 0;
+                    return GLib.SOURCE_REMOVE; // Открыто по клику - не закрываем при наведении
+                }
+
+                if (this._previewMenu && this._previewMenu.isOpen) {
+                    // Проверяем физическое положение курсора
+                    const overIcon = this._isPointerOverActor(this);
+                    const overMenu = this._isPointerOverActor(this._previewMenu.actor);
+
+                    if (!overIcon && !overMenu) {
+                        // Курсор ушел И с иконки, И с меню
+                        this._previewMenu.close();
+                        this._hideLoopId = 0;
+                        return GLib.SOURCE_REMOVE; // Останавливаем цикл
+                    } else {
+                        // Курсор всё ещё над иконкой или над превью, продолжаем следить
+                        return GLib.SOURCE_CONTINUE; 
+                    }
+                }
+
+                // Меню уже закрыто каким-то другим способом, выходим
+                this._hideLoopId = 0;
+                return GLib.SOURCE_REMOVE; 
+            });
+        }
+    }
+
+    _showHoverPreview() {
+        const windows = this.getInterestingWindows();
+        if (windows.length === 0) return;
+
+        // Не показываем превью по наведению, если уже открыто стандартное контекстное меню
+        if (this._menu && this._menu.isOpen) return;
+
+        this._ensurePreviewMenu();
+
+        if (!this._previewMenu.isOpen) {
+            this.emit('menu-state-changed', true);
+            this._previewMenu.popup();
+        }
     }
 
     // Try to do the right thing when attempting to launch a new window of an app. In

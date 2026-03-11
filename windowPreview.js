@@ -11,6 +11,7 @@ import {
     GObject,
     Meta,
     St,
+    Gio,
 } from './dependencies/gi.js';
 
 import {
@@ -25,6 +26,8 @@ import {
     Theming,
     Utils,
 } from './imports.js';
+
+import { Slider } from 'resource:///org/gnome/shell/ui/slider.js';
 
 const PREVIEW_MAX_WIDTH = 250;
 const PREVIEW_MAX_HEIGHT = 150;
@@ -66,11 +69,77 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
     }
 
     _redisplay() {
+        // 1. Очищаем старые миниатюры
         if (this._previewBox)
             this._previewBox.destroy();
+
+        // 2. Очищаем старую медиа-панель
+        if (this._mediaSection) {
+            this._mediaSection.destroy();
+            this._mediaSection = null;
+        }
+
+        // 3. Создаем и добавляем список окон
         this._previewBox = new WindowPreviewList(this._source);
         this.addMenuItem(this._previewBox);
         this._previewBox._redisplay();
+
+        // 4. Ищем медиаплеер асинхронно, не блокируя цикл событий
+        this._injectMediaControlsAsync();
+    }
+
+    _injectMediaControlsAsync() {
+        if (!this._app) return;
+        const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
+        const appNameParts = appId.split('.');
+        const baseName = appNameParts[appNameParts.length - 1];
+
+        // Используем асинхронный вызов .call() вместо синхронного .call_sync()
+        Gio.DBus.session.call(
+            'org.freedesktop.DBus',
+            '/org/freedesktop/DBus',
+            'org.freedesktop.DBus',
+            'ListNames',
+            null,
+            new GLib.VariantType('(as)'),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (conn, res) => {
+                try {
+                    const result = conn.call_finish(res);
+                    const [names] = result.deep_unpack();
+                    
+                    const matchedName = names.find(name => {
+                        if (!name.startsWith('org.mpris.MediaPlayer2.')) return false;
+                        const mprisId = name.toLowerCase();
+                        return mprisId.includes(appId) || mprisId.includes(baseName);
+                    });
+
+                    if (matchedName) {
+                        try {
+                            // Проверяем, не было ли меню закрыто пользователем за эти миллисекунды
+                            // Обращение к this._previewBox выкинет ошибку, если объект уничтожен
+                            if (!this._previewBox || this._mediaSection) return;
+
+                            const mediaControls = this._buildMediaControls(matchedName);
+                            if (mediaControls) {
+                                this._mediaSection = new PopupMenu.PopupMenuSection();
+                                this._mediaSection.actor.add_child(mediaControls);
+                                this.addMenuItem(this._mediaSection);
+                            }
+                        } catch (err) {
+                            // Изящно игнорируем ошибку already disposed, если меню успели закрыть
+                            if (err.message && !err.message.includes('already disposed')) {
+                                console.error(`[Dash-to-Dock] Ошибка добавления UI: ${err.message}`);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Игнорируем ошибки сети/DBus
+                }
+            }
+        );
     }
 
     popup() {
@@ -89,6 +158,164 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
 
         if (this._destroyId)
             this._source.disconnect(this._destroyId);
+    }
+    
+    
+    _buildMediaControls(mprisName) {
+        const mainContainer = new St.BoxLayout({
+            vertical: true,
+            x_align: Clutter.ActorAlign.FILL,
+            margin_top: 10,
+            margin_bottom: 5
+        });
+
+        // --- 1. Контейнер для кнопок ---
+        const buttonsContainer = new St.BoxLayout({
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'media-controls'
+        });
+
+        const playIcon = new St.Icon({
+            icon_name: 'media-playback-start-symbolic',
+            icon_size: 24,
+            style_class: 'popup-menu-icon'
+        });
+
+        const updatePlayIcon = (status) => {
+            playIcon.icon_name = status === 'Playing' 
+                ? 'media-playback-pause-symbolic' 
+                : 'media-playback-start-symbolic';
+        };
+
+        const callMpris = (method) => {
+            Gio.DBus.session.call(
+                mprisName, '/org/mpris/MediaPlayer2', 'org.mpris.MediaPlayer2.Player', method,
+                null, null, Gio.DBusCallFlags.NONE, -1, null,
+                (conn, res) => { try { conn.call_finish(res); } catch (e) {} }
+            );
+        };
+
+        const createButton = (icon, action) => {
+            const btn = new St.Button({
+                child: icon instanceof St.Icon ? icon : new St.Icon({
+                    icon_name: icon, icon_size: 24, style_class: 'popup-menu-icon'
+                }),
+                style_class: 'button',
+                reactive: true, can_focus: true, track_hover: true,
+                margin_left: 5, margin_right: 5
+            });
+            btn.connect('clicked', () => callMpris(action));
+            return btn;
+        };
+
+        buttonsContainer.add_child(createButton('media-skip-backward-symbolic', 'Previous'));
+        buttonsContainer.add_child(createButton(playIcon, 'PlayPause'));
+        buttonsContainer.add_child(createButton('media-skip-forward-symbolic', 'Next'));
+
+
+    // --- 2. Контейнер для ползунка громкости (ДЛЯ НОВЫХ ВЕРСИЙ GNOME) ---
+        
+        // Создаем базовый, некликабельный элемент меню
+        const volumeItem = new PopupMenu.PopupBaseMenuItem({ activate: false });
+        
+        const volIcon = new St.Icon({
+            icon_name: 'audio-volume-high-symbolic',
+            icon_size: 16,
+            style_class: 'popup-menu-icon',
+            margin_right: 10
+        });
+        
+        // Используем новый системный Slider
+        const volumeSlider = new Slider(0.5);
+        volumeSlider.x_expand = true; // Растягиваем ползунок на всю ширину
+        volumeSlider.y_align = Clutter.ActorAlign.CENTER;
+
+        // Вставляем элементы в пункт меню
+        volumeItem.add_child(volIcon);
+        volumeItem.add_child(volumeSlider);
+
+        // Собираем элементы в главный контейнер
+        mainContainer.add_child(buttonsContainer);
+        mainContainer.add_child(volumeItem);
+
+
+        // --- 3. Логика синхронизации громкости и статуса ---
+        let isUpdatingVolume = false;
+
+        // Отправляем новую громкость в плеер при перетаскивании ползунка
+        volumeSlider.connect('notify::value', () => {
+            if (isUpdatingVolume) return;
+            
+            Gio.DBus.session.call(
+                mprisName,
+                '/org/mpris/MediaPlayer2',
+                'org.freedesktop.DBus.Properties',
+                'Set',
+                new GLib.Variant('(ssv)', [
+                    'org.mpris.MediaPlayer2.Player',
+                    'Volume',
+                    new GLib.Variant('d', volumeSlider.value) // Передаем свойство .value
+                ]),
+                null, Gio.DBusCallFlags.NONE, -1, null, null
+            );
+        });
+
+        // Запрашиваем свойства при открытии превью
+        Gio.DBus.session.call(
+            mprisName,
+            '/org/mpris/MediaPlayer2',
+            'org.freedesktop.DBus.Properties',
+            'GetAll',
+            new GLib.Variant('(s)', ['org.mpris.MediaPlayer2.Player']),
+            new GLib.VariantType('(a{sv})'),
+            Gio.DBusCallFlags.NONE, -1, null,
+            (conn, res) => {
+                try {
+                    const result = conn.call_finish(res);
+                    const props = result.deep_unpack()[0];
+                    
+                    if (props['PlaybackStatus']) {
+                        updatePlayIcon(props['PlaybackStatus'].deep_unpack());
+                    }
+                    if (props['Volume'] !== undefined) {
+                        isUpdatingVolume = true;
+                        // Обновляем значение напрямую
+                        volumeSlider.value = Math.min(props['Volume'].deep_unpack(), 1.0);
+                        isUpdatingVolume = false;
+                    }
+                } catch (e) { }
+            }
+        );
+
+        // Подписываемся на изменения свойств
+        const signalId = Gio.DBus.session.signal_subscribe(
+            mprisName,
+            'org.freedesktop.DBus.Properties',
+            'PropertiesChanged',
+            '/org/mpris/MediaPlayer2',
+            null, Gio.DBusSignalFlags.NONE,
+            (conn, sender, objectPath, iface, signal, parameters) => {
+                const [interfaceName, changedProperties] = parameters.deep_unpack();
+                if (interfaceName === 'org.mpris.MediaPlayer2.Player') {
+                    if (changedProperties['PlaybackStatus']) {
+                        updatePlayIcon(changedProperties['PlaybackStatus'].deep_unpack());
+                    }
+                    if (changedProperties['Volume'] !== undefined) {
+                        isUpdatingVolume = true;
+                        volumeSlider.value = Math.min(changedProperties['Volume'].deep_unpack(), 1.0);
+                        isUpdatingVolume = false;
+                    }
+                }
+            }
+        );
+
+        // Очистка при закрытии меню
+        mainContainer.connect('destroy', () => {
+            if (signalId) Gio.DBus.session.signal_unsubscribe(signalId);
+        });
+
+        return mainContainer;
     }
 }
 
