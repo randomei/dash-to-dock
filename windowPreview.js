@@ -295,25 +295,47 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
             clearStream(); // Отключаемся от старого
             appStream = newStream;
 
-            // Если у нас сохранена громкость (пользователь менял её ранее), 
-            // принудительно применяем её к новому треку, чтобы избежать сброса
-            if (lastUserVolume !== -1) {
-                const maxVol = mixerControl.get_vol_max_norm();
-                // Проверяем, отличается ли громкость нового трека от нашей сохраненной
-                if (Math.abs((appStream.volume / maxVol) - lastUserVolume) > 0.05) {
-                    appStream.volume = lastUserVolume * maxVol;
-                    appStream.push_volume();
-                }
-            } else {
-                lastUserVolume = appStream.volume / mixerControl.get_vol_max_norm();
-            }
-
             volumeSlider.reactive = true; 
             volumeSlider.opacity = 255;
-            updateSliderFromStream();
 
-            streamVolumeId = appStream.connect('notify::volume', updateSliderFromStream);
-            streamMutedId = appStream.connect('notify::is-muted', updateSliderFromStream);
+            // 1. Мгновенно фиксируем ползунок визуально, чтобы он не прыгал перед глазами
+            if (lastUserVolume !== -1) {
+                isUpdatingVolume = true;
+                volumeSlider.value = lastUserVolume;
+                
+                if (lastUserVolume === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
+                else if (lastUserVolume < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
+                else if (lastUserVolume < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
+                else volIcon.icon_name = 'audio-volume-high-symbolic';
+                isUpdatingVolume = false;
+            }
+
+            // 2. Делаем паузу в 200мс, чтобы приложение успело применить свои внутренние настройки
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                // Проверяем, актуален ли еще поток (пользователь мог быстро пропустить 3 трека подряд)
+                if (appStream !== newStream) return GLib.SOURCE_REMOVE;
+
+                // 3. Принудительно перезаписываем громкость приложения нашей сохраненной
+                if (lastUserVolume !== -1) {
+                    const maxVol = mixerControl.get_vol_max_norm();
+                    appStream.volume = lastUserVolume * maxVol;
+                    appStream.push_volume();
+                    
+                    if (appStream.is_muted && lastUserVolume > 0) {
+                        appStream.change_is_muted(false);
+                    }
+                } else {
+                    lastUserVolume = appStream.volume / mixerControl.get_vol_max_norm();
+                }
+
+                updateSliderFromStream();
+
+                // 4. И только теперь подписываемся на внешние изменения (когда "буря" улеглась)
+                streamVolumeId = appStream.connect('notify::volume', updateSliderFromStream);
+                streamMutedId = appStream.connect('notify::is-muted', updateSliderFromStream);
+
+                return GLib.SOURCE_REMOVE;
+            });
         };
 
         const findAudioStream = () => {
