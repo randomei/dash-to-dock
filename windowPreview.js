@@ -28,6 +28,7 @@ import {
 } from './imports.js';
 
 import { Slider } from 'resource:///org/gnome/shell/ui/slider.js';
+import Gvc from 'gi://Gvc';
 
 const PREVIEW_MAX_WIDTH = 250;
 const PREVIEW_MAX_HEIGHT = 150;
@@ -164,12 +165,13 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
     _buildMediaControls(mprisName) {
         const mainContainer = new St.BoxLayout({
             vertical: true,
-            x_align: Clutter.ActorAlign.FILL,
-            margin_top: 10,
-            margin_bottom: 5
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'margin-top: 10px; margin-bottom: 5px;'
         });
 
-        // --- 1. Контейнер для кнопок ---
+        // ==========================================
+        // ЧАСТЬ 1: УПРАВЛЕНИЕ ВОСПРОИЗВЕДЕНИЕМ (MPRIS)
+        // ==========================================
         const buttonsContainer = new St.BoxLayout({
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
@@ -178,7 +180,7 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
 
         const playIcon = new St.Icon({
             icon_name: 'media-playback-start-symbolic',
-            icon_size: 24,
+            icon_size: 22,
             style_class: 'popup-menu-icon'
         });
 
@@ -203,7 +205,7 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
                 }),
                 style_class: 'button',
                 reactive: true, can_focus: true, track_hover: true,
-                margin_left: 5, margin_right: 5
+                style: 'margin-left: 8px; margin-right: 8px;'
             });
             btn.connect('clicked', () => callMpris(action));
             return btn;
@@ -212,107 +214,154 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
         buttonsContainer.add_child(createButton('media-skip-backward-symbolic', 'Previous'));
         buttonsContainer.add_child(createButton(playIcon, 'PlayPause'));
         buttonsContainer.add_child(createButton('media-skip-forward-symbolic', 'Next'));
+        mainContainer.add_child(buttonsContainer);
 
 
-    // --- 2. Контейнер для ползунка громкости (ДЛЯ НОВЫХ ВЕРСИЙ GNOME) ---
-        
-        // Создаем базовый, некликабельный элемент меню
-        const volumeItem = new PopupMenu.PopupBaseMenuItem({ activate: false });
+        // ==========================================
+        // ЧАСТЬ 2: УПРАВЛЕНИЕ ГРОМКОСТЬЮ (GVC / ОС МИКШЕР)
+        // ==========================================
+        const volumeContainer = new St.BoxLayout({
+            vertical: false,
+            y_align: Clutter.ActorAlign.CENTER,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'margin-top: 10px;'
+        });
         
         const volIcon = new St.Icon({
-            icon_name: 'audio-volume-high-symbolic',
+            icon_name: 'audio-volume-muted-symbolic', // Иконка по умолчанию, пока аудиопоток не найден
             icon_size: 16,
             style_class: 'popup-menu-icon',
-            margin_right: 10
+            style: 'margin-right: 10px;'
         });
         
-        // Используем новый системный Slider
-        const volumeSlider = new Slider(0.5);
-        volumeSlider.x_expand = true; // Растягиваем ползунок на всю ширину
+        const volumeSlider = new Slider(0);
+        volumeSlider.width = 200;
         volumeSlider.y_align = Clutter.ActorAlign.CENTER;
+        
+        // Отключаем и затеняем ползунок, пока не найдем активный аудиопоток
+        volumeSlider.reactive = false; 
+        volumeSlider.opacity = 128;    
 
-        // Вставляем элементы в пункт меню
-        volumeItem.add_child(volIcon);
-        volumeItem.add_child(volumeSlider);
+        volumeContainer.add_child(volIcon);
+        volumeContainer.add_child(volumeSlider);
+        mainContainer.add_child(volumeContainer);
 
-        // Собираем элементы в главный контейнер
-        mainContainer.add_child(buttonsContainer);
-        mainContainer.add_child(volumeItem);
-
-
-        // --- 3. Логика синхронизации громкости и статуса ---
         let isUpdatingVolume = false;
+        let appStream = null;
 
-        // Отправляем новую громкость в плеер при перетаскивании ползунка
-        volumeSlider.connect('notify::value', () => {
-            if (isUpdatingVolume) return;
+        // Инициализируем системный GNOME Volume Control
+        const mixerControl = new Gvc.MixerControl({ name: 'DashToDock Volume' });
+        mixerControl.open();
+
+        // Подготавливаем имена для поиска приложения в микшере PulseAudio
+        const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
+        const appNameParts = appId.split('.');
+        const baseName = appNameParts[appNameParts.length - 1]; // Например, "firefox"
+
+        const updateSliderFromStream = () => {
+            if (!appStream || isUpdatingVolume) return;
+            isUpdatingVolume = true;
             
-            Gio.DBus.session.call(
-                mprisName,
-                '/org/mpris/MediaPlayer2',
-                'org.freedesktop.DBus.Properties',
-                'Set',
-                new GLib.Variant('(ssv)', [
-                    'org.mpris.MediaPlayer2.Player',
-                    'Volume',
-                    new GLib.Variant('d', volumeSlider.value) // Передаем свойство .value
-                ]),
-                null, Gio.DBusCallFlags.NONE, -1, null, null
-            );
+            const maxVol = mixerControl.get_vol_max_norm(); // Получаем 100% громкости в координатах системы
+            volumeSlider.value = appStream.volume / maxVol;
+            
+            // Динамическая смена иконки (как в основном меню GNOME)
+            if (appStream.is_muted || volumeSlider.value === 0) {
+                volIcon.icon_name = 'audio-volume-muted-symbolic';
+            } else if (volumeSlider.value < 0.3) {
+                volIcon.icon_name = 'audio-volume-low-symbolic';
+            } else if (volumeSlider.value < 0.7) {
+                volIcon.icon_name = 'audio-volume-medium-symbolic';
+            } else {
+                volIcon.icon_name = 'audio-volume-high-symbolic';
+            }
+            
+            isUpdatingVolume = false;
+        };
+
+        const findAudioStream = () => {
+            const streams = mixerControl.get_sink_inputs(); // Берем все потоки, которые сейчас издают звук
+            appStream = streams.find(stream => {
+                const streamAppId = (stream.get_application_id() || '').toLowerCase();
+                const streamName = (stream.get_name() || '').toLowerCase();
+                // Ищем поток, который принадлежит нашему приложению
+                return streamAppId === appId || streamAppId.includes(baseName) || streamName.includes(baseName);
+            });
+
+            if (appStream) {
+                // Аудиопоток найден! Включаем ползунок
+                volumeSlider.reactive = true; 
+                volumeSlider.opacity = 255;
+                updateSliderFromStream();
+
+                // Подписываемся на внешние изменения (если вы поменяете громкость в настройках системы)
+                appStream.connect('notify::volume', updateSliderFromStream);
+                appStream.connect('notify::is-muted', updateSliderFromStream);
+            }
+        };
+
+        mixerControl.connect('state-changed', (control, state) => {
+            if (state === Gvc.MixerControlState.READY) findAudioStream();
         });
 
-        // Запрашиваем свойства при открытии превью
+        // Слушаем появление новых потоков (например, если вкладка Firefox была без звука, а потом вы включили видео)
+        mixerControl.connect('stream-added', () => {
+            if (!appStream && mixerControl.get_state() === Gvc.MixerControlState.READY) findAudioStream();
+        });
+
+        // Отправка новой громкости в ядро системы при перетаскивании ползунка
+        volumeSlider.connect('notify::value', () => {
+            if (isUpdatingVolume || !appStream) return;
+            isUpdatingVolume = true;
+
+            const maxVol = mixerControl.get_vol_max_norm();
+            appStream.volume = volumeSlider.value * maxVol;
+            appStream.push_volume(); // Применяем громкость в PulseAudio/PipeWire
+
+            if (appStream.is_muted && volumeSlider.value > 0) {
+                appStream.change_is_muted(false); // Снимаем "Mute", если потянули ползунок вверх
+            }
+
+            // Быстро обновляем иконку локально для визуальной плавности
+            if (volumeSlider.value === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
+            else if (volumeSlider.value < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
+            else if (volumeSlider.value < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
+            else volIcon.icon_name = 'audio-volume-high-symbolic';
+
+            isUpdatingVolume = false;
+        });
+
+
+        // ==========================================
+        // ЧАСТЬ 3: СИНХРОНИЗАЦИЯ MPRIS (ТОЛЬКО СТАТУС ПЛЕЕРА)
+        // ==========================================
         Gio.DBus.session.call(
-            mprisName,
-            '/org/mpris/MediaPlayer2',
-            'org.freedesktop.DBus.Properties',
-            'GetAll',
-            new GLib.Variant('(s)', ['org.mpris.MediaPlayer2.Player']),
-            new GLib.VariantType('(a{sv})'),
-            Gio.DBusCallFlags.NONE, -1, null,
+            mprisName, '/org/mpris/MediaPlayer2', 'org.freedesktop.DBus.Properties', 'Get',
+            new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'PlaybackStatus']),
+            new GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, -1, null,
             (conn, res) => {
                 try {
                     const result = conn.call_finish(res);
-                    const props = result.deep_unpack()[0];
-                    
-                    if (props['PlaybackStatus']) {
-                        updatePlayIcon(props['PlaybackStatus'].deep_unpack());
-                    }
-                    if (props['Volume'] !== undefined) {
-                        isUpdatingVolume = true;
-                        // Обновляем значение напрямую
-                        volumeSlider.value = Math.min(props['Volume'].deep_unpack(), 1.0);
-                        isUpdatingVolume = false;
-                    }
-                } catch (e) { }
+                    updatePlayIcon(result.deep_unpack()[0].deep_unpack());
+                } catch (e) {}
             }
         );
 
-        // Подписываемся на изменения свойств
         const signalId = Gio.DBus.session.signal_subscribe(
-            mprisName,
-            'org.freedesktop.DBus.Properties',
-            'PropertiesChanged',
-            '/org/mpris/MediaPlayer2',
+            mprisName, 'org.freedesktop.DBus.Properties', 'PropertiesChanged', '/org/mpris/MediaPlayer2',
             null, Gio.DBusSignalFlags.NONE,
             (conn, sender, objectPath, iface, signal, parameters) => {
                 const [interfaceName, changedProperties] = parameters.deep_unpack();
-                if (interfaceName === 'org.mpris.MediaPlayer2.Player') {
-                    if (changedProperties['PlaybackStatus']) {
-                        updatePlayIcon(changedProperties['PlaybackStatus'].deep_unpack());
-                    }
-                    if (changedProperties['Volume'] !== undefined) {
-                        isUpdatingVolume = true;
-                        volumeSlider.value = Math.min(changedProperties['Volume'].deep_unpack(), 1.0);
-                        isUpdatingVolume = false;
-                    }
+                if (interfaceName === 'org.mpris.MediaPlayer2.Player' && changedProperties['PlaybackStatus']) {
+                    updatePlayIcon(changedProperties['PlaybackStatus'].deep_unpack());
                 }
             }
         );
 
-        // Очистка при закрытии меню
+        // Очистка памяти при закрытии меню
         mainContainer.connect('destroy', () => {
             if (signalId) Gio.DBus.session.signal_unsubscribe(signalId);
+            mixerControl.close(); // Обязательно отключаемся от аудиосервера
         });
 
         return mainContainer;
