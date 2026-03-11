@@ -224,11 +224,11 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
             vertical: false,
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.CENTER,
-            style: 'margin-top: 10px;'
+            style: 'margin-top: 18px;' // Отступ, который мы настроили ранее
         });
         
         const volIcon = new St.Icon({
-            icon_name: 'audio-volume-muted-symbolic', // Иконка по умолчанию, пока аудиопоток не найден
+            icon_name: 'audio-volume-muted-symbolic',
             icon_size: 16,
             style_class: 'popup-menu-icon',
             style: 'margin-right: 10px;'
@@ -237,8 +237,6 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
         const volumeSlider = new Slider(0);
         volumeSlider.width = 200;
         volumeSlider.y_align = Clutter.ActorAlign.CENTER;
-        
-        // Отключаем и затеняем ползунок, пока не найдем активный аудиопоток
         volumeSlider.reactive = false; 
         volumeSlider.opacity = 128;    
 
@@ -248,24 +246,27 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
 
         let isUpdatingVolume = false;
         let appStream = null;
+        
+        // Переменные для хранения подписок на сигналы и кэша громкости
+        let streamVolumeId = 0;
+        let streamMutedId = 0;
+        let lastUserVolume = -1; // -1 означает, что пользователь еще не трогал ползунок
 
-        // Инициализируем системный GNOME Volume Control
         const mixerControl = new Gvc.MixerControl({ name: 'DashToDock Volume' });
         mixerControl.open();
 
-        // Подготавливаем имена для поиска приложения в микшере PulseAudio
         const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
         const appNameParts = appId.split('.');
-        const baseName = appNameParts[appNameParts.length - 1]; // Например, "firefox"
+        const baseName = appNameParts[appNameParts.length - 1];
 
         const updateSliderFromStream = () => {
             if (!appStream || isUpdatingVolume) return;
             isUpdatingVolume = true;
             
-            const maxVol = mixerControl.get_vol_max_norm(); // Получаем 100% громкости в координатах системы
+            const maxVol = mixerControl.get_vol_max_norm();
             volumeSlider.value = appStream.volume / maxVol;
+            lastUserVolume = volumeSlider.value; // Запоминаем текущую громкость потока
             
-            // Динамическая смена иконки (как в основном меню GNOME)
             if (appStream.is_muted || volumeSlider.value === 0) {
                 volIcon.icon_name = 'audio-volume-muted-symbolic';
             } else if (volumeSlider.value < 0.3) {
@@ -275,54 +276,87 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
             } else {
                 volIcon.icon_name = 'audio-volume-high-symbolic';
             }
-            
             isUpdatingVolume = false;
         };
 
+        // Функция аккуратного отключения от мертвого потока
+        const clearStream = () => {
+            if (appStream) {
+                if (streamVolumeId) appStream.disconnect(streamVolumeId);
+                if (streamMutedId) appStream.disconnect(streamMutedId);
+            }
+            appStream = null;
+            streamVolumeId = 0;
+            streamMutedId = 0;
+        };
+
+        // Функция подключения к новому потоку (например, при смене трека)
+        const attachToStream = (newStream) => {
+            clearStream(); // Отключаемся от старого
+            appStream = newStream;
+
+            // Если у нас сохранена громкость (пользователь менял её ранее), 
+            // принудительно применяем её к новому треку, чтобы избежать сброса
+            if (lastUserVolume !== -1) {
+                const maxVol = mixerControl.get_vol_max_norm();
+                // Проверяем, отличается ли громкость нового трека от нашей сохраненной
+                if (Math.abs((appStream.volume / maxVol) - lastUserVolume) > 0.05) {
+                    appStream.volume = lastUserVolume * maxVol;
+                    appStream.push_volume();
+                }
+            } else {
+                lastUserVolume = appStream.volume / mixerControl.get_vol_max_norm();
+            }
+
+            volumeSlider.reactive = true; 
+            volumeSlider.opacity = 255;
+            updateSliderFromStream();
+
+            streamVolumeId = appStream.connect('notify::volume', updateSliderFromStream);
+            streamMutedId = appStream.connect('notify::is-muted', updateSliderFromStream);
+        };
+
         const findAudioStream = () => {
-            const streams = mixerControl.get_sink_inputs(); // Берем все потоки, которые сейчас издают звук
-            appStream = streams.find(stream => {
+            const streams = mixerControl.get_sink_inputs();
+            const foundStream = streams.find(stream => {
                 const streamAppId = (stream.get_application_id() || '').toLowerCase();
                 const streamName = (stream.get_name() || '').toLowerCase();
-                // Ищем поток, который принадлежит нашему приложению
                 return streamAppId === appId || streamAppId.includes(baseName) || streamName.includes(baseName);
             });
 
-            if (appStream) {
-                // Аудиопоток найден! Включаем ползунок
-                volumeSlider.reactive = true; 
-                volumeSlider.opacity = 255;
-                updateSliderFromStream();
-
-                // Подписываемся на внешние изменения (если вы поменяете громкость в настройках системы)
-                appStream.connect('notify::volume', updateSliderFromStream);
-                appStream.connect('notify::is-muted', updateSliderFromStream);
+            if (foundStream) {
+                if (foundStream !== appStream) {
+                    attachToStream(foundStream); // Подключаемся к новому
+                }
+            } else {
+                // Если поток исчез (поставили на паузу в браузере и он убил поток)
+                clearStream();
+                volumeSlider.reactive = false;
+                volumeSlider.opacity = 128;
             }
         };
 
+        // Подписываемся на события появления и исчезновения потоков
         mixerControl.connect('state-changed', (control, state) => {
             if (state === Gvc.MixerControlState.READY) findAudioStream();
         });
+        mixerControl.connect('stream-added', findAudioStream);
+        mixerControl.connect('stream-removed', findAudioStream);
 
-        // Слушаем появление новых потоков (например, если вкладка Firefox была без звука, а потом вы включили видео)
-        mixerControl.connect('stream-added', () => {
-            if (!appStream && mixerControl.get_state() === Gvc.MixerControlState.READY) findAudioStream();
-        });
-
-        // Отправка новой громкости в ядро системы при перетаскивании ползунка
         volumeSlider.connect('notify::value', () => {
             if (isUpdatingVolume || !appStream) return;
             isUpdatingVolume = true;
 
+            lastUserVolume = volumeSlider.value; // Обновляем пользовательский кэш
+
             const maxVol = mixerControl.get_vol_max_norm();
             appStream.volume = volumeSlider.value * maxVol;
-            appStream.push_volume(); // Применяем громкость в PulseAudio/PipeWire
+            appStream.push_volume();
 
             if (appStream.is_muted && volumeSlider.value > 0) {
-                appStream.change_is_muted(false); // Снимаем "Mute", если потянули ползунок вверх
+                appStream.change_is_muted(false);
             }
 
-            // Быстро обновляем иконку локально для визуальной плавности
             if (volumeSlider.value === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
             else if (volumeSlider.value < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
             else if (volumeSlider.value < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
@@ -361,7 +395,8 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
         // Очистка памяти при закрытии меню
         mainContainer.connect('destroy', () => {
             if (signalId) Gio.DBus.session.signal_unsubscribe(signalId);
-            mixerControl.close(); // Обязательно отключаемся от аудиосервера
+            clearStream();
+            mixerControl.close();
         });
 
         return mainContainer;
