@@ -625,6 +625,11 @@
       <summary>Hide application tooltip</summary>
       <description>Hide tooltip when hovering application in the dash.</description>
     </key>
+    <key type="b" name="show-previews-on-hover">
+      <default>false</default>
+      <summary>Show window previews on hover</summary>
+      <description>Show window previews and media controls when hovering over an app icon.</description>
+    </key>
     <key name="show-icons-emblems" type="b">
       <default>true</default>
       <summary>Show application icons emblems</summary>

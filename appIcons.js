@@ -777,7 +777,15 @@ const DockAbstractAppIcon = GObject.registerClass({
     }
     
     _onHoverChanged() {
+        if (!this._dockSettings) {
+            this._dockSettings = new Gio.Settings({ 
+                schema_id: 'org.gnome.shell.extensions.dash-to-dock' 
+            });
+        }
         if (this.hover) {
+            if (!this._dockSettings.get_boolean('show-previews-on-hover')) {
+                return;
+            }
             // Курсор зашел на иконку
             if (this._hoverTimeoutId === 0) {
                 this._hoverTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
