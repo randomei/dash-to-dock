@@ -143,14 +143,70 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
         );
     }
 
-    popup() {
+    popup(isHover = false) {
+        this.isHoverMenu = isHover;
+        this.blockSourceEvents = !isHover;
+
         const windows = this._source.getInterestingWindows();
         if (windows.length > 0) {
             this._redisplay();
+            
+            // Стандартное открытие GNOME (меню будет отображаться корректно)
             this.open(BoxPointer.PopupAnimation.FULL);
-            this.actor.navigate_focus(null, St.DirectionType.TAB_FORWARD, false);
+            
+            // Не забираем фокус клавиатуры, если это hover
+            if (!isHover) {
+                this.actor.navigate_focus(null, St.DirectionType.TAB_FORWARD, false);
+            }
+            
             this._source.emit('sync-tooltip');
         }
+    }
+
+    close(animate) {
+        const event = Clutter.get_current_event();
+        
+        // Если меню закрывается, и это hover-меню, проверяем причину закрытия
+        if (this.isHoverMenu && this.isOpen && event) {
+            const type = event.type();
+            
+            // Если причиной закрытия стал клик мыши
+            if (type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.BUTTON_RELEASE) {
+                
+                // Получаем координаты клика
+                const [x, y] = event.get_coords();
+                
+                // Проверяем, попал ли клик в границы нашей иконки (this._source)
+                const [success, relX, relY] = this._source.transform_stage_point(x, y);
+                
+                if (success && relX >= 0 && relX <= this._source.width && relY >= 0 && relY <= this._source.height) {
+                    
+                    const button = event.get_button();
+                    
+                    // БИНГО! Пользователь кликнул по иконке.
+                    // Откладываем выполнение на долю секунды (через GLib.idle_add), 
+                    // чтобы Wayland успел завершить закрытие меню и снять блокировку ввода.
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                        if (button === 1) { // Левый клик
+                            const wins = this._source.getInterestingWindows();
+                            if (wins.length > 0) {
+                                Main.activateWindow(wins[0]); // Разворачиваем окно
+                            } else {
+                                this._source.app.activate();
+                            }
+                        } else if (button === 2) { // Средний клик
+                            this._source.launchNewWindow();
+                        } else if (button === 3) { // Правый клик
+                            this._source.popupMenu();
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+            }
+        }
+
+        // Обязательно вызываем стандартное закрытие, чтобы ничего не ломалось
+        super.close(animate);
     }
 
     _onDestroy() {

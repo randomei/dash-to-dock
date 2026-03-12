@@ -843,14 +843,13 @@ const DockAbstractAppIcon = GObject.registerClass({
         const windows = this.getInterestingWindows();
         if (windows.length === 0) return;
 
-        // Не показываем превью по наведению, если уже открыто стандартное контекстное меню
         if (this._menu && this._menu.isOpen) return;
 
         this._ensurePreviewMenu();
 
         if (!this._previewMenu.isOpen) {
             this.emit('menu-state-changed', true);
-            this._previewMenu.popup();
+            this._previewMenu.popup(true);
         }
     }
 
