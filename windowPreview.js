@@ -70,42 +70,186 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
     }
 
     _redisplay() {
-        // 1. Очищаем старые миниатюры
         if (this._previewBox)
             this._previewBox.destroy();
 
-        // 2. Очищаем старую медиа-панель
         if (this._mediaSection) {
             this._mediaSection.destroy();
             this._mediaSection = null;
         }
 
-        // 3. Создаем и добавляем список окон
         this._previewBox = new WindowPreviewList(this._source);
         this.addMenuItem(this._previewBox);
         this._previewBox._redisplay();
 
-        // 4. Ищем медиаплеер асинхронно, не блокируя цикл событий
-        this._injectMediaControlsAsync();
+        this._mediaSection = new PopupMenu.PopupMenuSection();
+        this._mediaContainer = new St.BoxLayout({
+            vertical: true,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'margin-top: 10px; margin-bottom: 5px;'
+        });
+        this._mediaSection.actor.add_child(this._mediaContainer);
+        
+        this._isMediaSectionAdded = false;
+
+        this._injectVolumeControls();
+        this._injectMprisControlsAsync();
     }
 
-    _injectMediaControlsAsync() {
+    _checkAndAddMediaSection() {
+        if (!this._isMediaSectionAdded && this._previewBox) {
+            this.addMenuItem(this._mediaSection);
+            this._isMediaSectionAdded = true;
+        }
+    }
+
+    _injectVolumeControls() {
         if (!this._app) return;
         const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
         const appNameParts = appId.split('.');
         const baseName = appNameParts[appNameParts.length - 1];
 
-        // Используем асинхронный вызов .call() вместо синхронного .call_sync()
+        const volumeContainer = new St.BoxLayout({
+            vertical: false,
+            y_align: Clutter.ActorAlign.CENTER,
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'margin-top: 12px;'
+        });
+        
+        const volIcon = new St.Icon({
+            icon_name: 'audio-volume-muted-symbolic',
+            icon_size: 16,
+            style_class: 'popup-menu-icon',
+            style: 'margin-right: 10px;'
+        });
+        
+        const volumeSlider = new Slider(0);
+        volumeSlider.width = 200;
+        volumeSlider.y_align = Clutter.ActorAlign.CENTER;
+        volumeSlider.reactive = false; 
+        volumeSlider.opacity = 128;    
+
+        volumeContainer.add_child(volIcon);
+        volumeContainer.add_child(volumeSlider);
+
+        let isUpdatingVolume = false;
+        let appStream = null;
+        let streamVolumeId = 0;
+        let streamMutedId = 0;
+
+        const mixerControl = new Gvc.MixerControl({ name: 'DashToDock Volume' });
+        mixerControl.open();
+
+        const updateSliderFromStream = () => {
+            if (!appStream || isUpdatingVolume) return;
+            isUpdatingVolume = true;
+            
+            const maxVol = mixerControl.get_vol_max_norm();
+            volumeSlider.value = appStream.volume / maxVol;
+            
+            if (appStream.is_muted || volumeSlider.value === 0) {
+                volIcon.icon_name = 'audio-volume-muted-symbolic';
+            } else if (volumeSlider.value < 0.3) {
+                volIcon.icon_name = 'audio-volume-low-symbolic';
+            } else if (volumeSlider.value < 0.7) {
+                volIcon.icon_name = 'audio-volume-medium-symbolic';
+            } else {
+                volIcon.icon_name = 'audio-volume-high-symbolic';
+            }
+            isUpdatingVolume = false;
+        };
+
+        const clearStream = () => {
+            if (appStream) {
+                if (streamVolumeId) appStream.disconnect(streamVolumeId);
+                if (streamMutedId) appStream.disconnect(streamMutedId);
+            }
+            appStream = null;
+            streamVolumeId = 0;
+            streamMutedId = 0;
+        };
+
+        const attachToStream = (newStream) => {
+            clearStream();
+            appStream = newStream;
+
+            volumeSlider.reactive = true; 
+            volumeSlider.opacity = 255;
+
+            updateSliderFromStream();
+
+            streamVolumeId = appStream.connect('notify::volume', updateSliderFromStream);
+            streamMutedId = appStream.connect('notify::is-muted', updateSliderFromStream);
+        };
+
+        const findAudioStream = () => {
+            if (!this._mediaContainer) return;
+            const streams = mixerControl.get_sink_inputs();
+            const foundStream = streams.find(stream => {
+                const streamAppId = (stream.get_application_id() || '').toLowerCase();
+                const streamName = (stream.get_name() || '').toLowerCase();
+                return streamAppId === appId || streamAppId.includes(baseName) || streamName.includes(baseName);
+            });
+
+            if (foundStream) {
+                if (!volumeContainer.get_parent()) {
+                    this._mediaContainer.add_child(volumeContainer);
+                    this._checkAndAddMediaSection();
+                }
+
+                if (foundStream !== appStream) attachToStream(foundStream);
+            } else {
+                clearStream();
+                volumeSlider.reactive = false;
+                volumeSlider.opacity = 128;
+            }
+        };
+
+        const stateId = mixerControl.connect('state-changed', (control, state) => {
+            if (state === Gvc.MixerControlState.READY) findAudioStream();
+        });
+        const addedId = mixerControl.connect('stream-added', findAudioStream);
+        const removedId = mixerControl.connect('stream-removed', findAudioStream);
+
+        volumeSlider.connect('notify::value', () => {
+            if (isUpdatingVolume || !appStream) return;
+            isUpdatingVolume = true;
+
+            const maxVol = mixerControl.get_vol_max_norm();
+            appStream.volume = volumeSlider.value * maxVol;
+            appStream.push_volume();
+
+            if (appStream.is_muted && volumeSlider.value > 0) {
+                appStream.change_is_muted(false);
+            }
+
+            if (volumeSlider.value === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
+            else if (volumeSlider.value < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
+            else if (volumeSlider.value < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
+            else volIcon.icon_name = 'audio-volume-high-symbolic';
+
+            isUpdatingVolume = false;
+        });
+
+        this._mediaSection.actor.connect('destroy', () => {
+            clearStream();
+            if (stateId) mixerControl.disconnect(stateId);
+            if (addedId) mixerControl.disconnect(addedId);
+            if (removedId) mixerControl.disconnect(removedId);
+            mixerControl.close();
+            this._mediaContainer = null;
+        });
+    }
+    
+    _injectMprisControlsAsync() {
+        if (!this._app) return;
+        const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
+        const appNameParts = appId.split('.');
+        const baseName = appNameParts[appNameParts.length - 1];
+
         Gio.DBus.session.call(
-            'org.freedesktop.DBus',
-            '/org/freedesktop/DBus',
-            'org.freedesktop.DBus',
-            'ListNames',
-            null,
-            new GLib.VariantType('(as)'),
-            Gio.DBusCallFlags.NONE,
-            -1,
-            null,
+            'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'ListNames',
+            null, new GLib.VariantType('(as)'), Gio.DBusCallFlags.NONE, -1, null,
             (conn, res) => {
                 try {
                     const result = conn.call_finish(res);
@@ -119,94 +263,40 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
 
                     if (matchedName) {
                         try {
-                            // Проверяем, не было ли меню закрыто пользователем за эти миллисекунды
-                            // Обращение к this._previewBox выкинет ошибку, если объект уничтожен
-                            if (!this._previewBox || this._mediaSection) return;
+                            if (!this._previewBox || !this._mediaContainer) return;
 
-                            const mediaControls = this._buildMediaControls(matchedName);
-                            if (mediaControls) {
-                                this._mediaSection = new PopupMenu.PopupMenuSection();
-                                this._mediaSection.actor.add_child(mediaControls);
-                                this.addMenuItem(this._mediaSection);
+                            const mprisControls = this._buildMprisControls(matchedName);
+                            if (mprisControls) {
+                                this._mediaContainer.insert_child_at_index(mprisControls, 0);
+                                this._checkAndAddMediaSection();
                             }
                         } catch (err) {
-                            // Изящно игнорируем ошибку already disposed, если меню успели закрыть
                             if (err.message && !err.message.includes('already disposed')) {
-                                console.error(`[Dash-to-Dock] Ошибка добавления UI: ${err.message}`);
+                                console.error(`[Dash-to-Dock] Ошибка добавления MPRIS: ${err.message}`);
                             }
                         }
                     }
-                } catch (e) {
-                    // Игнорируем ошибки сети/DBus
-                }
+                } catch (e) {}
             }
         );
     }
 
     popup(isHover = false) {
         this.isHoverMenu = isHover;
-        this.blockSourceEvents = !isHover;
+        
+        this.blockSourceEvents = !isHover; 
 
         const windows = this._source.getInterestingWindows();
         if (windows.length > 0) {
             this._redisplay();
-            
-            // Стандартное открытие GNOME (меню будет отображаться корректно)
             this.open(BoxPointer.PopupAnimation.FULL);
             
-            // Не забираем фокус клавиатуры, если это hover
             if (!isHover) {
                 this.actor.navigate_focus(null, St.DirectionType.TAB_FORWARD, false);
             }
             
             this._source.emit('sync-tooltip');
         }
-    }
-
-    close(animate) {
-        const event = Clutter.get_current_event();
-        
-        // Если меню закрывается, и это hover-меню, проверяем причину закрытия
-        if (this.isHoverMenu && this.isOpen && event) {
-            const type = event.type();
-            
-            // Если причиной закрытия стал клик мыши
-            if (type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.BUTTON_RELEASE) {
-                
-                // Получаем координаты клика
-                const [x, y] = event.get_coords();
-                
-                // Проверяем, попал ли клик в границы нашей иконки (this._source)
-                const [success, relX, relY] = this._source.transform_stage_point(x, y);
-                
-                if (success && relX >= 0 && relX <= this._source.width && relY >= 0 && relY <= this._source.height) {
-                    
-                    const button = event.get_button();
-                    
-                    // БИНГО! Пользователь кликнул по иконке.
-                    // Откладываем выполнение на долю секунды (через GLib.idle_add), 
-                    // чтобы Wayland успел завершить закрытие меню и снять блокировку ввода.
-                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                        if (button === 1) { // Левый клик
-                            const wins = this._source.getInterestingWindows();
-                            if (wins.length > 0) {
-                                Main.activateWindow(wins[0]); // Разворачиваем окно
-                            } else {
-                                this._source.app.activate();
-                            }
-                        } else if (button === 2) { // Средний клик
-                            this._source.launchNewWindow();
-                        } else if (button === 3) { // Правый клик
-                            this._source.popupMenu();
-                        }
-                        return GLib.SOURCE_REMOVE;
-                    });
-                }
-            }
-        }
-
-        // Обязательно вызываем стандартное закрытие, чтобы ничего не ломалось
-        super.close(animate);
     }
 
     _onDestroy() {
@@ -218,16 +308,7 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
     }
     
     
-    _buildMediaControls(mprisName) {
-        const mainContainer = new St.BoxLayout({
-            vertical: true,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'margin-top: 10px; margin-bottom: 5px;'
-        });
-
-        // ==========================================
-        // ЧАСТЬ 1: УПРАВЛЕНИЕ ВОСПРОИЗВЕДЕНИЕМ (MPRIS)
-        // ==========================================
+    _buildMprisControls(mprisName) {
         const buttonsContainer = new St.BoxLayout({
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
@@ -270,183 +351,7 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
         buttonsContainer.add_child(createButton('media-skip-backward-symbolic', 'Previous'));
         buttonsContainer.add_child(createButton(playIcon, 'PlayPause'));
         buttonsContainer.add_child(createButton('media-skip-forward-symbolic', 'Next'));
-        mainContainer.add_child(buttonsContainer);
 
-
-        // ==========================================
-        // ЧАСТЬ 2: УПРАВЛЕНИЕ ГРОМКОСТЬЮ (GVC / ОС МИКШЕР)
-        // ==========================================
-        const volumeContainer = new St.BoxLayout({
-            vertical: false,
-            y_align: Clutter.ActorAlign.CENTER,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'margin-top: 18px;' // Отступ, который мы настроили ранее
-        });
-        
-        const volIcon = new St.Icon({
-            icon_name: 'audio-volume-muted-symbolic',
-            icon_size: 16,
-            style_class: 'popup-menu-icon',
-            style: 'margin-right: 10px;'
-        });
-        
-        const volumeSlider = new Slider(0);
-        volumeSlider.width = 200;
-        volumeSlider.y_align = Clutter.ActorAlign.CENTER;
-        volumeSlider.reactive = false; 
-        volumeSlider.opacity = 128;    
-
-        volumeContainer.add_child(volIcon);
-        volumeContainer.add_child(volumeSlider);
-        mainContainer.add_child(volumeContainer);
-
-        let isUpdatingVolume = false;
-        let appStream = null;
-        
-        // Переменные для хранения подписок на сигналы и кэша громкости
-        let streamVolumeId = 0;
-        let streamMutedId = 0;
-        let lastUserVolume = -1; // -1 означает, что пользователь еще не трогал ползунок
-
-        const mixerControl = new Gvc.MixerControl({ name: 'DashToDock Volume' });
-        mixerControl.open();
-
-        const appId = this._app.get_id().replace('.desktop', '').toLowerCase();
-        const appNameParts = appId.split('.');
-        const baseName = appNameParts[appNameParts.length - 1];
-
-        const updateSliderFromStream = () => {
-            if (!appStream || isUpdatingVolume) return;
-            isUpdatingVolume = true;
-            
-            const maxVol = mixerControl.get_vol_max_norm();
-            volumeSlider.value = appStream.volume / maxVol;
-            lastUserVolume = volumeSlider.value; // Запоминаем текущую громкость потока
-            
-            if (appStream.is_muted || volumeSlider.value === 0) {
-                volIcon.icon_name = 'audio-volume-muted-symbolic';
-            } else if (volumeSlider.value < 0.3) {
-                volIcon.icon_name = 'audio-volume-low-symbolic';
-            } else if (volumeSlider.value < 0.7) {
-                volIcon.icon_name = 'audio-volume-medium-symbolic';
-            } else {
-                volIcon.icon_name = 'audio-volume-high-symbolic';
-            }
-            isUpdatingVolume = false;
-        };
-
-        // Функция аккуратного отключения от мертвого потока
-        const clearStream = () => {
-            if (appStream) {
-                if (streamVolumeId) appStream.disconnect(streamVolumeId);
-                if (streamMutedId) appStream.disconnect(streamMutedId);
-            }
-            appStream = null;
-            streamVolumeId = 0;
-            streamMutedId = 0;
-        };
-
-        // Функция подключения к новому потоку (например, при смене трека)
-        const attachToStream = (newStream) => {
-            clearStream(); // Отключаемся от старого
-            appStream = newStream;
-
-            volumeSlider.reactive = true; 
-            volumeSlider.opacity = 255;
-
-            // 1. Мгновенно фиксируем ползунок визуально, чтобы он не прыгал перед глазами
-            if (lastUserVolume !== -1) {
-                isUpdatingVolume = true;
-                volumeSlider.value = lastUserVolume;
-                
-                if (lastUserVolume === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
-                else if (lastUserVolume < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
-                else if (lastUserVolume < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
-                else volIcon.icon_name = 'audio-volume-high-symbolic';
-                isUpdatingVolume = false;
-            }
-
-            // 2. Делаем паузу в 200мс, чтобы приложение успело применить свои внутренние настройки
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-                // Проверяем, актуален ли еще поток (пользователь мог быстро пропустить 3 трека подряд)
-                if (appStream !== newStream) return GLib.SOURCE_REMOVE;
-
-                // 3. Принудительно перезаписываем громкость приложения нашей сохраненной
-                if (lastUserVolume !== -1) {
-                    const maxVol = mixerControl.get_vol_max_norm();
-                    appStream.volume = lastUserVolume * maxVol;
-                    appStream.push_volume();
-                    
-                    if (appStream.is_muted && lastUserVolume > 0) {
-                        appStream.change_is_muted(false);
-                    }
-                } else {
-                    lastUserVolume = appStream.volume / mixerControl.get_vol_max_norm();
-                }
-
-                updateSliderFromStream();
-
-                // 4. И только теперь подписываемся на внешние изменения (когда "буря" улеглась)
-                streamVolumeId = appStream.connect('notify::volume', updateSliderFromStream);
-                streamMutedId = appStream.connect('notify::is-muted', updateSliderFromStream);
-
-                return GLib.SOURCE_REMOVE;
-            });
-        };
-
-        const findAudioStream = () => {
-            const streams = mixerControl.get_sink_inputs();
-            const foundStream = streams.find(stream => {
-                const streamAppId = (stream.get_application_id() || '').toLowerCase();
-                const streamName = (stream.get_name() || '').toLowerCase();
-                return streamAppId === appId || streamAppId.includes(baseName) || streamName.includes(baseName);
-            });
-
-            if (foundStream) {
-                if (foundStream !== appStream) {
-                    attachToStream(foundStream); // Подключаемся к новому
-                }
-            } else {
-                // Если поток исчез (поставили на паузу в браузере и он убил поток)
-                clearStream();
-                volumeSlider.reactive = false;
-                volumeSlider.opacity = 128;
-            }
-        };
-
-        // Подписываемся на события появления и исчезновения потоков
-        mixerControl.connect('state-changed', (control, state) => {
-            if (state === Gvc.MixerControlState.READY) findAudioStream();
-        });
-        mixerControl.connect('stream-added', findAudioStream);
-        mixerControl.connect('stream-removed', findAudioStream);
-
-        volumeSlider.connect('notify::value', () => {
-            if (isUpdatingVolume || !appStream) return;
-            isUpdatingVolume = true;
-
-            lastUserVolume = volumeSlider.value; // Обновляем пользовательский кэш
-
-            const maxVol = mixerControl.get_vol_max_norm();
-            appStream.volume = volumeSlider.value * maxVol;
-            appStream.push_volume();
-
-            if (appStream.is_muted && volumeSlider.value > 0) {
-                appStream.change_is_muted(false);
-            }
-
-            if (volumeSlider.value === 0) volIcon.icon_name = 'audio-volume-muted-symbolic';
-            else if (volumeSlider.value < 0.3) volIcon.icon_name = 'audio-volume-low-symbolic';
-            else if (volumeSlider.value < 0.7) volIcon.icon_name = 'audio-volume-medium-symbolic';
-            else volIcon.icon_name = 'audio-volume-high-symbolic';
-
-            isUpdatingVolume = false;
-        });
-
-
-        // ==========================================
-        // ЧАСТЬ 3: СИНХРОНИЗАЦИЯ MPRIS (ТОЛЬКО СТАТУС ПЛЕЕРА)
-        // ==========================================
         Gio.DBus.session.call(
             mprisName, '/org/mpris/MediaPlayer2', 'org.freedesktop.DBus.Properties', 'Get',
             new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'PlaybackStatus']),
@@ -470,14 +375,11 @@ export class WindowPreviewMenu extends PopupMenu.PopupMenu {
             }
         );
 
-        // Очистка памяти при закрытии меню
-        mainContainer.connect('destroy', () => {
+        buttonsContainer.connect('destroy', () => {
             if (signalId) Gio.DBus.session.signal_unsubscribe(signalId);
-            clearStream();
-            mixerControl.close();
         });
 
-        return mainContainer;
+        return buttonsContainer;
     }
 }
 

@@ -239,6 +239,15 @@ const DockAbstractAppIcon = GObject.registerClass({
         this._previewIsSticky = false;
         this._hideLoopId = 0;
         this.connect('notify::hover', this._onHoverChanged.bind(this));
+        
+        this.connect('button-press-event', () => {
+            if (this._hoverTimeoutId > 0) {
+                GLib.source_remove(this._hoverTimeoutId);
+                this._hoverTimeoutId = 0;
+                this._isHoverPreview = false;
+            }
+            return Clutter.EVENT_PROPAGATE; 
+        });
     }
 
     _onDestroy() {
@@ -492,6 +501,29 @@ const DockAbstractAppIcon = GObject.registerClass({
     }
 
     activate(button) {
+        if (this._previewMenu && this._previewMenu.isOpen && this._previewMenu.isHoverMenu) {
+            this._previewMenu.close();
+
+            const event = Clutter.get_current_event();
+            let modifiers = event ? event.get_state() : 0;
+            modifiers &= Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK;
+
+            if (!modifiers) {
+                if (button === 1) {
+                    const wins = this.getInterestingWindows();
+                    if (wins.length > 0) {
+                        Main.activateWindow(wins[0]);
+                    } else {
+                        this.app.activate();
+                    }
+                    return;
+                } else if (button === 2) {
+                    this.launchNewWindow();
+                    return;
+                }
+            }
+        }
+        
         const event = Clutter.get_current_event();
         let modifiers = event ? event.get_state() : 0;
 
